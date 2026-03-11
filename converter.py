@@ -14,11 +14,29 @@ import io
 # Helpers
 # ---------------------------------------------------------------------------
 
+def is_mostly_text(text: str) -> bool:
+    """Check if a string is actually readable text or just binary garbage."""
+    if not text:
+        return False
+    # Count characters outside common printable ranges
+    # We allow basic ASCII, common whitespace, and Latin-1 supplement
+    weird_count = 0
+    for char in text:
+        cp = ord(char)
+        # Check if it's a control char (but allow \t \n \r) or a very high unicode plane
+        if (cp < 32 and cp not in (9, 10, 13)) or (cp > 255 and cp < 0x2000):
+            weird_count += 1
+    
+    ratio = weird_count / len(text)
+    return ratio < 0.15
+
 def try_decode_text(data: bytes) -> str | None:
-    """Try to decode bytes to string using common encodings."""
-    for enc in ('utf-8', 'utf-8-sig', 'latin-1', 'cp1252'):
+    """Try to decode bytes to string using common encodings, with validation."""
+    for enc in ('utf-8', 'utf-8-sig', 'utf-16', 'latin-1', 'cp1252'):
         try:
-            return data.decode(enc)
+            text = data.decode(enc)
+            if is_mostly_text(text):
+                return text
         except (UnicodeDecodeError, LookupError):
             continue
     return None

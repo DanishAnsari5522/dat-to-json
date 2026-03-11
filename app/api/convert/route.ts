@@ -4,25 +4,47 @@ import { promisify } from "util";
 import { writeFile, unlink } from "fs/promises";
 import path from "path";
 import os from "os";
+import zlib from "zlib";
 
 const execFilePromise = promisify(execFile);
+const gunzip = promisify(zlib.gunzip);
+const inflate = promisify(zlib.inflate);
 
 /**
  * Robust DAT to JSON converter logic (Pure JS Fallback)
  */
+function isMostlyText(text: string): boolean {
+  if (!text) return false;
+  // Count non-printable/weird characters
+  // We allow common whitespace (tab, newline, carriage return)
+  // but block most other control characters and excessive non-latin characters 
+  // unless they are in common ranges.
+  const weirdChars = text.match(/[^\x20-\x7E\s\u00A0-\u00FF]/g);
+  const ratio = (weirdChars?.length || 0) / text.length;
+  return ratio < 0.15; // If more than 15% is "weird", it's probably binary
+}
+
 function tryDecodeText(data: Buffer): string | null {
-  const encodings = ['utf-8', 'latin1', 'utf16le'];
-  for (const enc of encodings) {
-    try {
-      const text = data.toString(enc as BufferEncoding);
-      // Basic check if it looks like healthy text (not mostly control chars)
-      const controlChars = text.match(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g);
-      if (!controlChars || controlChars.length / text.length < 0.1) {
-        return text;
-      }
-    } catch (e) { continue; }
-  }
+  // Try UTF-8 first
+  try {
+    const utf8 = data.toString('utf-8');
+    if (isMostlyText(utf8)) return utf8;
+  } catch (e) {}
+
+  // Try UTF-16LE (common on Windows)
+  try {
+    const utf16 = data.toString('utf16le');
+    if (isMostlyText(utf16)) return utf16;
+  } catch (e) {}
+
   return null;
+}
+
+function extractStrings(data: Buffer): string[] {
+  // Extract ASCII strings of length 4+
+  const str = data.toString('binary');
+  const matches = str.match(/[\x20-\x7E]{4,}/g);
+  return matches || [];
 }
 
 function parseJS(text: string) {
@@ -96,17 +118,33 @@ export async function POST(req: NextRequest) {
 
     const buffer = Buffer.from(await file.arrayBuffer());
     
+    // --- TRY DECOMPRESSION ---
+    let processedBuffer = buffer;
+    let decompressionName = "";
+    
+    try {
+      if (buffer[0] === 0x1f && buffer[1] === 0x8b) {
+        processedBuffer = await gunzip(buffer);
+        decompressionName = "gzip";
+      } else if (buffer[0] === 0x78) { // Likely zlib header
+        processedBuffer = await inflate(buffer);
+        decompressionName = "zlib";
+      }
+    } catch (e) {
+      // Fallback to original buffer if decompression fails
+      processedBuffer = buffer;
+    }
+
     // Create a temporary file to process
     const tempDir = os.tmpdir();
     tempFilePath = path.join(tempDir, `upload_${Date.now()}_${file.name.replace(/[^a-zA-Z0-9.]/g, '_')}`);
-    await writeFile(tempFilePath, buffer);
+    await writeFile(tempFilePath, processedBuffer);
 
     // Call the Python converter script
     const scriptPath = path.join(process.cwd(), "converter.py");
     
     try {
       // Execute python script
-      // We try 'python3' then 'python'
       let stdout;
       try {
         const res = await execFilePromise("python3", [scriptPath, tempFilePath]);
@@ -118,33 +156,47 @@ export async function POST(req: NextRequest) {
       
       const result = JSON.parse(stdout);
       if (result.error) return NextResponse.json({ error: result.error }, { status: 422 });
+      
+      if (decompressionName) {
+        result.format = `${decompressionName}_${result.format}`;
+      }
       return NextResponse.json(result);
 
     } catch (execError: any) {
       console.warn("Python execution failed, falling back to JS parser:", execError.message);
       
       // FALLBACK TO JAVASCRIPT PARSER
-      const text = tryDecodeText(buffer);
+      const text = tryDecodeText(processedBuffer);
       if (text) {
         const jsResult = parseJS(text);
         if (jsResult) {
           return NextResponse.json({
             ...jsResult,
-            note: "Processed using JS fallback (Python not available on server)."
+            note: `Processed using JS fallback (${decompressionName || 'plain text'}).`
           });
         }
         
         return NextResponse.json({
             format: "text_raw",
             data: text.slice(0, 5000) + (text.length > 5000 ? "... [truncated]" : ""),
-            note: "Could not detect structured format. Showing raw text."
+            note: "Detected as text but structured format unknown."
+        });
+      }
+
+      // If text fails, try string extraction as a final readability boost
+      const strings = extractStrings(processedBuffer);
+      if (strings.length > 5) {
+        return NextResponse.json({
+          format: "extracted_strings",
+          data: strings.slice(0, 100),
+          note: "Binary file. Extracted readable fragments."
         });
       }
 
       return NextResponse.json({ 
         format: "binary_hex",
-        data: buffer.slice(0, 1024).toString('hex').match(/.{1,2}/g)?.join(' ') || "",
-        note: "Binary file detected and Python is missing. Showing Hex dump."
+        data: processedBuffer.slice(0, 1024).toString('hex').match(/.{1,2}/g)?.join(' ') || "",
+        note: "Pure binary data detected. No readable text found."
       }, { status: 200 });
     }
   } catch (error) {
